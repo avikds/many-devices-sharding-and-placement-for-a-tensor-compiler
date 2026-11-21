@@ -839,8 +839,107 @@ def reduce_shards(cluster, out, t, axis, op="sum"):
         device=0
     )
 
-# Step 9 - matmul_shards (not yet solved)
-# TODO: implement
+# Step 9 - matmul_shards
+def matmul_shards(cluster, out, x, w):
+    """Multiply row-sharded x by replicated w on every device; return the result's handle."""
+
+    # Validate that X is sharded.
+    if x["layout"] != "sharded":
+        raise ValueError("X must have sharded layout")
+
+    # Validate the matrix dimensions.
+    x_shape = tuple(x["shape"])
+    w_shape = tuple(w["shape"])
+
+    if len(x_shape) != 2 or len(w_shape) != 2:
+        raise ValueError("X and W must both be two-dimensional tensors")
+
+    n, d = x_shape
+    w_d, m = w_shape
+
+    # The inner dimensions of the matrices must match.
+    if d != w_d:
+        raise ValueError(
+            f"Incompatible matrix dimensions: X has {d} columns "
+            f"but W has {w_d} rows"
+        )
+
+    # Validate the layout of W before performing any operations.
+    if w["layout"] == "sharded":
+        raise ValueError("W must be replicated or single, not sharded")
+
+    if w["layout"] not in ("replicated", "single"):
+        raise ValueError("Unsupported layout for W")
+
+    num_devices = len(cluster.devices)
+
+    # Validate the sharding axis of X.
+    if x["axis"] not in (-2, -1, 0, 1):
+        raise ValueError("X must be sharded along axis 0 or axis 1")
+
+    # Normalize the axis to support negative axis indices.
+    x_axis = x["axis"] % 2
+
+    # Validate the source device when W is a single-device tensor.
+    if w["layout"] == "single":
+        home = w["device"]
+
+        if (
+            not isinstance(home, (int, np.integer))
+            or not -num_devices <= home < num_devices
+        ):
+            raise ValueError("W has an invalid source device")
+
+    # ---------------------------------------------------------
+    # Step 1: Ensure X is sharded along axis 0 (rows).
+    # ---------------------------------------------------------
+    if x_axis == 1:
+        reshard(cluster, x, axis=0)
+
+    # ---------------------------------------------------------
+    # Step 2: Ensure W is replicated across all devices.
+    # ---------------------------------------------------------
+    if w["layout"] == "single":
+
+        # Replicate W from its current device.
+        replicate(
+            cluster,
+            w["name"],
+            home=w["device"]
+        )
+
+        # Update the existing W handle in place.
+        w.update({
+            "layout": "replicated",
+            "axis": None,
+            "bounds": None,
+            "device": None
+        })
+
+    # ---------------------------------------------------------
+    # Step 3: Perform local matrix multiplication on each device.
+    # ---------------------------------------------------------
+    for device in cluster.devices:
+
+        # Each device multiplies its local shard of X
+        # by its complete local replica of W.
+        device.run(
+            out,
+            lambda a, b: a @ b,
+            x["name"],
+            w["name"]
+        )
+
+    # ---------------------------------------------------------
+    # Step 4: Return the row-sharded output handle.
+    # ---------------------------------------------------------
+    return handle(
+        out,
+        (n, m),
+        "sharded",
+        axis=0,
+        bounds=x["bounds"]
+    )
 
 # Step 10 - place_graph (not yet solved)
 # TODO: implement
