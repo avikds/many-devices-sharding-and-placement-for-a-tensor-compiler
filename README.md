@@ -17,7 +17,7 @@ python scaffold.py
 - [x] **5.** gather
 - [x] **6.** reshard
 - [ ] **7.** map_shards
-- [ ] **8.** reduce_shards
+- [x] **8.** reduce_shards
 - [ ] **9.** matmul_shards
 - [ ] **10.** place_graph
 - [ ] **11.** allreduce_sum
