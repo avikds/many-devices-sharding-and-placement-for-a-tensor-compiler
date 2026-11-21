@@ -319,8 +319,112 @@ def replicate(cluster, name, home=0):
         "replicated"
     )
 
-# Step 5 - gather (not yet solved)
-# TODO: implement
+# Step 5 - gather
+def gather(cluster, t, home=0):
+    """Bring the tensor behind handle t back to device home as one buffer; update and return t."""
+
+    # Normalize and validate the home device index.
+    num_devices = len(cluster.devices)
+
+    if home < 0:
+        home += num_devices
+
+    if not 0 <= home < num_devices:
+        raise IndexError("Home device index out of range")
+
+    name = t["name"]
+    layout = t["layout"]
+
+    # Get the destination device.
+    home_device = cluster.devices[home]
+
+    if layout == "sharded":
+
+        axis = t["axis"]
+
+        # Transfer every remote shard to the home device.
+        # Each remote shard is stored under a temporary name.
+        # Transfers are performed in device order.
+        for i in range(num_devices):
+
+            if i == home:
+                continue
+
+            temp_name = f"{name}@{i}"
+
+            # Copy this device's shard to the home device.
+            cluster.copy(
+                i,
+                home,
+                name,
+                dst_name=temp_name
+            )
+
+            # Free the original shard after a successful transfer.
+            cluster.devices[i].free(name)
+
+        # Construct input names in device order.
+        # The home device's own shard remains under the original name.
+        input_names = [
+            name if i == home else f"{name}@{i}"
+            for i in range(num_devices)
+        ]
+
+        # Concatenate all shards along the original sharding axis.
+        # The result replaces the home device's original shard.
+        home_device.run(
+            name,
+            lambda *arrays: np.concatenate(arrays, axis=axis),
+            *input_names
+        )
+
+        # Free the temporary shard buffers after reconstruction.
+        for i in range(num_devices):
+            if i != home:
+                home_device.free(f"{name}@{i}")
+
+    elif layout == "replicated":
+
+        # Keep the complete tensor on the home device.
+        # Free every other device's replica.
+        for i in range(num_devices):
+
+            if i == home:
+                continue
+
+            cluster.devices[i].free(name)
+
+    elif layout == "single":
+
+        # Find the device currently holding the complete tensor.
+        current_device = t["device"]
+
+        # Move the tensor only when it is not already on the home device.
+        if current_device != home:
+
+            # Copy the complete tensor to the home device.
+            cluster.copy(
+                current_device,
+                home,
+                name
+            )
+
+            # Release the buffer on its previous device.
+            cluster.devices[current_device].free(name)
+
+    else:
+        raise ValueError(f"Unsupported tensor layout: {layout}")
+
+    # Update the existing handle to represent a single-device tensor.
+    t.update({
+        "layout": "single",
+        "axis": None,
+        "bounds": None,
+        "device": home
+    })
+
+    # Return the updated handle.
+    return t
 
 # Step 6 - reshard (not yet solved)
 # TODO: implement
