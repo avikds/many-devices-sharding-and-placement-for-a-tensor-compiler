@@ -164,8 +164,32 @@ class Cluster:
             ]
         }
 
-# Step 3 - shard_bounds (not yet solved)
-# TODO: implement
+# Step 3 - shard_bounds
+def shard_bounds(n, k):
+    """Split 0..n-1 into k contiguous shards whose sizes differ by at most one."""
+
+    # Calculate the base shard size and the number of extra elements.
+    q, r = divmod(n, k)
+
+    bounds = []
+    start = 0
+
+    # Assign one shard to each device.
+    for i in range(k):
+
+        # The first r shards receive one additional element.
+        shard_size = q + (1 if i < r else 0)
+
+        # Calculate the exclusive ending index of the shard.
+        stop = start + shard_size
+
+        # Store the shard boundaries as (start, stop).
+        bounds.append((start, stop))
+
+        # The next shard begins where the current shard ends.
+        start = stop
+
+    return bounds
 
 # Step 4 - scatter (not yet solved)
 # TODO: implement
