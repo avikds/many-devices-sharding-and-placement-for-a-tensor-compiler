@@ -686,99 +686,100 @@ def map_shards(cluster, out, fn, *tensors):
 def reduce_shards(cluster, out, t, axis, op="sum"):
     """Reduce the sharded tensor behind t over axis with sum or max; return the result's handle."""
 
-    # Verify that the input tensor is sharded.
+    # Validate the tensor layout.
     if t["layout"] != "sharded":
-        raise ValueError("Input tensor must have a sharded layout")
+        raise ValueError("Input tensor must have sharded layout")
 
     # Validate the reduction operation.
     if op not in ("sum", "max"):
-        raise ValueError("Operation must be either 'sum' or 'max'")
+        raise ValueError("Operation must be 'sum' or 'max'")
 
-    num_devices = len(cluster.devices)
-    name = t["name"]
     shape = tuple(t["shape"])
     ndim = len(shape)
+    num_devices = len(cluster.devices)
 
-    # Normalize the reduction axis.
-    if not -ndim <= axis < ndim:
-        raise ValueError("Reduction axis out of range")
+    if ndim == 0:
+        raise ValueError("Cannot reduce a scalar tensor along an axis")
 
-    axis = axis % ndim
-
-    # Normalize the original sharding axis.
+    # Normalize the reduction and sharding axes.
+    reduce_axis = axis % ndim
     shard_axis = t["axis"] % ndim
 
-    # Obtain the original shard boundaries.
-    bounds = [tuple(b) for b in t["bounds"]]
-
-    if len(bounds) != num_devices:
-        raise ValueError("Shard bounds must match the number of devices")
-
-    # Calculate the output shape by removing the reduced dimension.
+    # The reduced axis is removed from the output shape.
     output_shape = tuple(
         dim for i, dim in enumerate(shape)
-        if i != axis
+        if i != reduce_axis
     )
 
-    # Select the appropriate local reduction function.
-    if op == "sum":
-        def reduce_fn(array):
-            return np.sum(array, axis=axis)
-    else:
-        def reduce_fn(array):
-            return np.max(array, axis=axis)
+    # Select the appropriate local reduction operation.
+    reducer = np.sum if op == "sum" else np.max
 
     # ---------------------------------------------------------
-    # Case 1: Reduction axis is different from shard axis.
+    # Case 1: Reduction axis is NOT the sharding axis.
     # ---------------------------------------------------------
-    if axis != shard_axis:
+    if reduce_axis != shard_axis:
 
         # Each device independently reduces its local shard.
-        # The output remains distributed across the same devices.
+        # Every device executes exactly one kernel.
         for device in cluster.devices:
-            device.run(out, reduce_fn, name)
 
-        # Removing a dimension before the sharding axis shifts
-        # the sharding axis index down by one.
-        new_shard_axis = shard_axis - (1 if axis < shard_axis else 0)
+            device.run(
+                out,
+                lambda x: reducer(x, axis=reduce_axis),
+                t["name"]
+            )
 
-        # Return a handle describing the still-sharded result.
+        # Adjust the sharding axis because the reduced dimension
+        # has been removed from the output shape.
+        new_shard_axis = (
+            shard_axis - 1
+            if reduce_axis < shard_axis
+            else shard_axis
+        )
+
+        # The output remains sharded with the same boundaries.
         return handle(
             out,
             output_shape,
             "sharded",
             axis=new_shard_axis,
-            bounds=bounds
+            bounds=t["bounds"]
         )
 
     # ---------------------------------------------------------
-    # Case 2: Reduction axis is the shard axis.
-    # Partial results must be combined on device 0.
+    # Case 2: Reduction axis IS the sharding axis.
     # ---------------------------------------------------------
 
-    # Identify devices whose shards contain actual elements
-    # along the sharding axis.
-    active_devices = [
+    # Identify devices with non-empty shards.
+    bounds = t["bounds"]
+
+    if len(bounds) != num_devices:
+        raise ValueError("Shard bounds must match the number of devices")
+
+    nonempty_devices = [
         i for i, (start, stop) in enumerate(bounds)
         if start < stop
     ]
 
-    # A reduction cannot proceed when every shard is empty.
-    if not active_devices:
-        raise ValueError("Cannot reduce an entirely empty tensor")
+    # A distributed reduction cannot proceed if no device
+    # contains any elements along the sharding axis.
+    if not nonempty_devices:
+        raise ValueError("Cannot reduce when every shard is empty")
 
-    # Step 1: Calculate one local partial reduction per
-    # non-empty device.
-    for i in active_devices:
+    # Step 1: Compute local partial reductions.
+    # Empty shards do not execute kernels.
+    for i in nonempty_devices:
+
         cluster.devices[i].run(
             out,
-            reduce_fn,
-            name
+            lambda x: reducer(x, axis=reduce_axis),
+            t["name"]
         )
 
-    # Step 2: Transfer partial results from nonzero devices
-    # to device 0, preserving device order.
-    for i in active_devices:
+    # Step 2: Transfer remote partial results to device 0.
+    # Store each partial under a temporary name.
+    # Free the remote partial after a successful copy.
+    for i in nonempty_devices:
 
         if i == 0:
             continue
@@ -792,42 +793,45 @@ def reduce_shards(cluster, out, t, axis, op="sum"):
             dst_name=temp_name
         )
 
-        # Release the partial result on its original device.
         cluster.devices[i].free(out)
 
-    # Step 3: Prepare the partial results in device order.
+    # Step 3: Prepare partial results in device order.
     partial_names = [
         out if i == 0 else f"{out}@{i}"
-        for i in active_devices
+        for i in nonempty_devices
     ]
 
-    # Define the final combine operation.
-    # The combination is performed from left to right.
+    # Define the combine operation.
+    # Partials are folded from left to right.
     def combine_partials(*partials):
+
         result = partials[0]
 
         for partial in partials[1:]:
+
             if op == "sum":
                 result = result + partial
+
             else:
                 result = np.maximum(result, partial)
 
         return result
 
-    # Run exactly one combine kernel on device 0.
-    # This kernel also runs when there is only one partial result.
+    # Device 0 executes exactly one combine kernel.
+    # This also runs when only one partial result exists.
     cluster.devices[0].run(
         out,
         combine_partials,
         *partial_names
     )
 
-    # Release all temporary partial-result buffers on device 0.
-    for i in active_devices:
+    # Step 4: Free all temporary partial buffers.
+    for i in nonempty_devices:
+
         if i != 0:
             cluster.devices[0].free(f"{out}@{i}")
 
-    # Step 4: The final result is a complete tensor on device 0.
+    # The final result is a complete tensor on device 0.
     return handle(
         out,
         output_shape,
