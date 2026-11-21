@@ -19,7 +19,7 @@ python scaffold.py
 - [x] **7.** map_shards
 - [x] **8.** reduce_shards
 - [x] **9.** matmul_shards
-- [ ] **10.** place_graph
+- [x] **10.** place_graph
 - [ ] **11.** allreduce_sum
 - [ ] **12.** train_step
 

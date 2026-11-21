@@ -941,8 +941,186 @@ def matmul_shards(cluster, out, x, w):
         bounds=x["bounds"]
     )
 
-# Step 10 - place_graph (not yet solved)
-# TODO: implement
+# Step 10 - place_graph
+def place_graph(kernels, inputs, n_devices, mem_limit):
+    """Place every kernel on a device with the fewest bytes copied under the memory limit."""
+
+    # No valid placement is possible without any devices.
+    if n_devices <= 0:
+        return None
+
+    n_kernels = len(kernels)
+
+    best_result = None
+    best_assignment = None
+
+    # ---------------------------------------------------------
+    # Step 1: Enumerate every possible kernel-to-device assignment.
+    # ---------------------------------------------------------
+    # Each kernel can execute on any of the n_devices devices.
+    # The number of possible placements is n_devices ** n_kernels.
+    #
+    # Assignments are generated in lexicographic order so that
+    # ties can be resolved deterministically.
+
+    for code in range(n_devices ** n_kernels):
+
+        # Decode the integer into a device assignment tuple.
+        assignment = [0] * n_kernels
+        remaining = code
+
+        for i in range(n_kernels - 1, -1, -1):
+            assignment[i] = remaining % n_devices
+            remaining //= n_devices
+
+        assignment = tuple(assignment)
+
+        # -----------------------------------------------------
+        # Step 2: Initialize memory, buffer homes and sizes.
+        # -----------------------------------------------------
+
+        # Every device initially holds its assigned input buffers.
+        memory = [0] * n_devices
+
+        # Track the original home device of every buffer.
+        buffer_home = {}
+
+        # Track the size of every buffer in bytes.
+        buffer_size = {}
+
+        # Track which buffers are present on each device.
+        resident = [set() for _ in range(n_devices)]
+
+        # Account for all graph input buffers.
+        for name, info in inputs.items():
+
+            device = info["device"]
+            nbytes = info["bytes"]
+
+            buffer_home[name] = device
+            buffer_size[name] = nbytes
+
+            memory[device] += nbytes
+            resident[device].add(name)
+
+        # Reject assignments whose initial inputs already
+        # exceed the memory limit.
+        if any(used > mem_limit for used in memory):
+            continue
+
+        bytes_moved = 0
+        schedule = []
+        valid = True
+
+        # -----------------------------------------------------
+        # Step 3: Simulate kernels in dependency order.
+        # -----------------------------------------------------
+
+        for kernel_index, kernel in enumerate(kernels):
+
+            kernel_name = kernel["name"]
+            kernel_inputs = kernel["inputs"]
+            kernel_bytes = kernel["bytes"]
+
+            # Select the assigned device for this kernel.
+            device = assignment[kernel_index]
+
+            # -------------------------------------------------
+            # Step 4: Ensure all input buffers are available.
+            # -------------------------------------------------
+
+            # Process inputs in their original argument order.
+            for buffer in kernel_inputs:
+
+                # Find the buffer's original home device.
+                source = buffer_home[buffer]
+
+                # Copy only if the required buffer is not already
+                # present on the assigned execution device.
+                if buffer not in resident[device]:
+
+                    nbytes = buffer_size[buffer]
+
+                    # The copy always originates from the buffer's
+                    # original home device.
+                    schedule.append(
+                        ("copy", buffer, source, device)
+                    )
+
+                    # Count communication and destination memory.
+                    bytes_moved += nbytes
+                    memory[device] += nbytes
+
+                    # Record the buffer as resident on this device.
+                    # This prevents repeated copies for later kernels.
+                    resident[device].add(buffer)
+
+                    # Reject the placement if memory is exceeded.
+                    if memory[device] > mem_limit:
+                        valid = False
+                        break
+
+            if not valid:
+                break
+
+            # -------------------------------------------------
+            # Step 5: Execute the kernel on its assigned device.
+            # -------------------------------------------------
+
+            schedule.append(
+                ("run", kernel_name, device)
+            )
+
+            # The kernel's output is stored permanently on its
+            # execution device.
+            memory[device] += kernel_bytes
+
+            # Register the output buffer and its home device.
+            buffer_home[kernel_name] = device
+            buffer_size[kernel_name] = kernel_bytes
+            resident[device].add(kernel_name)
+
+            # Every output remains allocated, so check memory.
+            if memory[device] > mem_limit:
+                valid = False
+                break
+
+        # -----------------------------------------------------
+        # Step 6: Discard invalid placements.
+        # -----------------------------------------------------
+
+        if not valid:
+            continue
+
+        # -----------------------------------------------------
+        # Step 7: Keep the placement with the lowest transfer cost.
+        # -----------------------------------------------------
+
+        # Assignments are generated lexicographically.
+        # Therefore, retaining the first placement on equal costs
+        # automatically satisfies the required tie-breaking rule.
+        if (
+            best_result is None
+            or bytes_moved < best_result["bytes_moved"]
+        ):
+
+            best_assignment = assignment
+
+            best_result = {
+                "assignment": {
+                    kernels[i]["name"]: assignment[i]
+                    for i in range(n_kernels)
+                },
+                "bytes_moved": bytes_moved,
+                "memory": memory,
+                "schedule": schedule
+            }
+
+    # Return None if every placement violates a memory limit.
+    if best_result is None:
+        return None
+
+    return best_result
 
 # Step 11 - allreduce_sum (not yet solved)
 # TODO: implement
