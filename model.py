@@ -576,8 +576,111 @@ def reshard(cluster, t, axis, bounds=None):
 
     return t
 
-# Step 7 - map_shards (not yet solved)
-# TODO: implement
+# Step 7 - map_shards
+def map_shards(cluster, out, fn, *tensors):
+    """Run the elementwise kernel fn on every device and return the handle of the result."""
+
+    # At least one operand is required.
+    if not tensors:
+        raise ValueError("At least one tensor operand is required")
+
+    # Validate all operand layouts before performing any copies or kernels.
+    for tensor in tensors:
+        if tensor["layout"] not in ("sharded", "replicated"):
+            raise ValueError(
+                "Single-layout operands must be scattered or replicated first"
+            )
+
+    # Identify all sharded operands.
+    sharded_tensors = [
+        tensor for tensor in tensors
+        if tensor["layout"] == "sharded"
+    ]
+
+    # ---------------------------------------------------------
+    # Case 1: At least one operand is sharded.
+    # ---------------------------------------------------------
+    if sharded_tensors:
+
+        # The first sharded operand is the reference layout.
+        reference = sharded_tensors[0]
+
+        reference_shape = tuple(reference["shape"])
+        reference_axis = reference["axis"]
+        reference_bounds = reference["bounds"]
+
+        # Validate the shapes of all sharded operands before
+        # performing any re-sharding or kernel execution.
+        for tensor in sharded_tensors[1:]:
+
+            if tuple(tensor["shape"]) != reference_shape:
+                raise ValueError(
+                    "All sharded operands must have the same shape"
+                )
+
+        # Align every other sharded operand with the reference.
+        # reshard() updates the corresponding handle in place.
+        for tensor in sharded_tensors[1:]:
+
+            reshard(
+                cluster,
+                tensor,
+                reference_axis,
+                bounds=reference_bounds
+            )
+
+        # Every device executes the kernel using its own local
+        # buffers. Replicated operands remain whole, allowing
+        # normal NumPy broadcasting against the local shards.
+        for device in cluster.devices:
+
+            input_names = [
+                tensor["name"]
+                for tensor in tensors
+            ]
+
+            device.run(
+                out,
+                fn,
+                *input_names
+            )
+
+        # Return a handle describing the sharded output.
+        return handle(
+            out,
+            reference_shape,
+            "sharded",
+            axis=reference_axis,
+            bounds=reference_bounds
+        )
+
+    # ---------------------------------------------------------
+    # Case 2: All operands are replicated.
+    # ---------------------------------------------------------
+
+    # Every device executes the kernel using its own replicas.
+    for device in cluster.devices:
+
+        input_names = [
+            tensor["name"]
+            for tensor in tensors
+        ]
+
+        device.run(
+            out,
+            fn,
+            *input_names
+        )
+
+    # Determine the output shape from the produced buffer.
+    output_shape = tuple(cluster.devices[0].buffers[out].shape)
+
+    # Return a handle describing the replicated output.
+    return handle(
+        out,
+        output_shape,
+        "replicated"
+    )
 
 # Step 8 - reduce_shards
 def reduce_shards(cluster, out, t, axis, op="sum"):
