@@ -13,7 +13,7 @@ python scaffold.py
 - [x] **1.** Device
 - [x] **2.** Cluster
 - [x] **3.** shard_bounds
-- [ ] **4.** scatter
+- [x] **4.** scatter
 - [ ] **5.** gather
 - [ ] **6.** reshard
 - [ ] **7.** map_shards

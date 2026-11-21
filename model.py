@@ -191,8 +191,133 @@ def shard_bounds(n, k):
 
     return bounds
 
-# Step 4 - scatter (not yet solved)
-# TODO: implement
+# Step 4 - scatter
+def handle(name, shape, layout, axis=None, bounds=None, device=None):
+    return {
+        "name": name,
+        "shape": tuple(shape),
+        "layout": layout,
+        "axis": axis,
+        "bounds": bounds,
+        "device": device
+    }
+
+
+def axis_slice(ndim, axis, start, stop):
+    return tuple(
+        slice(start, stop) if d == axis else slice(None)
+        for d in range(ndim)
+    )
+
+
+def scatter(cluster, name, axis=0, home=0):
+    """Cut the buffer on device home into one shard per device and return a sharded handle."""
+
+    # Get the number of devices and normalize the home device index.
+    num_devices = len(cluster.devices)
+
+    home_index = home
+    if home_index < 0:
+        home_index += num_devices
+
+    if not 0 <= home_index < num_devices:
+        raise IndexError("Home device index out of range")
+
+    # Retrieve the complete tensor from the home device.
+    source = cluster.devices[home_index].buffers[name]
+
+    # Preserve the original tensor shape.
+    shape = tuple(source.shape)
+    ndim = source.ndim
+
+    # Normalize the axis to support negative axis indices.
+    axis_index = axis + ndim if axis < 0 else axis
+
+    if not 0 <= axis_index < ndim:
+        raise ValueError("Axis out of range")
+
+    # Calculate the boundaries for all device shards.
+    bounds = shard_bounds(shape[axis_index], num_devices)
+
+    # Send each non-home shard to its corresponding device.
+    # The source must remain whole until all remote copies finish.
+    for device_index, (start, stop) in enumerate(bounds):
+
+        if device_index == home_index:
+            continue
+
+        # Construct a slice selecting only this device's shard.
+        region = axis_slice(ndim, axis_index, start, stop)
+
+        # Copy the selected region to the destination device.
+        # Empty shards are copied as well.
+        cluster.copy(
+            home_index,
+            device_index,
+            name,
+            region=region
+        )
+
+    # Reduce the home device's buffer to its own shard.
+    # This is a same-device copy and does not count as communication.
+    start, stop = bounds[home_index]
+
+    home_region = axis_slice(ndim, axis_index, start, stop)
+
+    cluster.copy(
+        home_index,
+        home_index,
+        name,
+        region=home_region
+    )
+
+    # Return the metadata handle for the sharded tensor.
+    return handle(
+        name,
+        shape,
+        "sharded",
+        axis=axis,
+        bounds=bounds
+    )
+
+
+def replicate(cluster, name, home=0):
+    """Copy the buffer on device home to every other device and return a replicated handle."""
+
+    # Get the number of devices and normalize the home index.
+    num_devices = len(cluster.devices)
+
+    home_index = home
+    if home_index < 0:
+        home_index += num_devices
+
+    if not 0 <= home_index < num_devices:
+        raise IndexError("Home device index out of range")
+
+    # Retrieve the complete tensor from the home device.
+    source = cluster.devices[home_index].buffers[name]
+
+    # Preserve the original tensor shape.
+    shape = tuple(source.shape)
+
+    # Copy the complete tensor to every other device in device order.
+    for device_index in range(num_devices):
+
+        if device_index == home_index:
+            continue
+
+        cluster.copy(
+            home_index,
+            device_index,
+            name
+        )
+
+    # Return the metadata handle for the replicated tensor.
+    return handle(
+        name,
+        shape,
+        "replicated"
+    )
 
 # Step 5 - gather (not yet solved)
 # TODO: implement
