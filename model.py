@@ -83,8 +83,86 @@ class Device:
         self.kernels += 1
         self.bytes_computed += bytes_read + bytes_written
 
-# Step 2 - Cluster (not yet solved)
-# TODO: implement
+# Step 2 - Cluster
+class Cluster:
+    """n simulated devices and the counted copies between them."""
+
+    def __init__(self, n, mem_limit):
+        # Create n devices, each with the same memory limit.
+        self.devices = [
+            Device(f"gpu{i}", mem_limit)
+            for i in range(n)
+        ]
+
+        # Initialize cross-device communication counters.
+        self.bytes_moved = 0
+        self.copies = 0
+
+        # Store transfer records as (src, dst, name, nbytes).
+        self.log = []
+
+    def copy(self, src, dst, name, dst_name=None, region=None):
+        """Copy a buffer (or a region of it) from device src to device dst."""
+
+        # Get the source and destination devices.
+        src_device = self.devices[src]
+        dst_device = self.devices[dst]
+
+        # Retrieve the source buffer. A missing name raises KeyError.
+        source_array = src_device.buffers[name]
+
+        # Extract only the requested region when specified.
+        if region is not None:
+            source_array = source_array[region]
+
+        # Use the original buffer name unless another destination
+        # buffer name has been explicitly provided.
+        if dst_name is None:
+            dst_name = name
+
+        # Allocate the copied data on the destination device.
+        # Device.alloc handles float64 copying and memory-limit checks.
+        dst_device.alloc(dst_name, source_array)
+
+        # Determine the actual number of bytes stored on the destination.
+        nbytes = dst_device.buffers[dst_name].nbytes
+
+        # Only cross-device copies contribute to communication statistics.
+        if src != dst:
+            self.bytes_moved += nbytes
+            self.copies += 1
+
+            # Record the transfer using the original source buffer name.
+            self.log.append((src, dst, name, nbytes))
+
+        # Return the number of bytes stored on the destination device.
+        return nbytes
+
+    def stats(self):
+        """Return bytes_moved, copies, bytes_computed, kernels and peak."""
+
+        # Aggregate computation statistics across all devices.
+        total_bytes_computed = sum(
+            device.bytes_computed
+            for device in self.devices
+        )
+
+        total_kernels = sum(
+            device.kernels
+            for device in self.devices
+        )
+
+        # Return communication and computation statistics.
+        return {
+            "bytes_moved": self.bytes_moved,
+            "copies": self.copies,
+            "bytes_computed": total_bytes_computed,
+            "kernels": total_kernels,
+            "peak": [
+                device.peak
+                for device in self.devices
+            ]
+        }
 
 # Step 3 - shard_bounds (not yet solved)
 # TODO: implement

@@ -11,7 +11,7 @@ python scaffold.py
 ## Steps
 
 - [x] **1.** Device
-- [ ] **2.** Cluster
+- [x] **2.** Cluster
 - [ ] **3.** shard_bounds
 - [ ] **4.** scatter
 - [ ] **5.** gather
