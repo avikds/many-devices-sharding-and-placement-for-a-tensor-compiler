@@ -426,8 +426,155 @@ def gather(cluster, t, home=0):
     # Return the updated handle.
     return t
 
-# Step 6 - reshard (not yet solved)
-# TODO: implement
+# Step 6 - reshard
+def reshard(cluster, t, axis, bounds=None):
+    """Recut the sharded tensor behind t along axis with the given bounds; update and return t."""
+
+    # Re-sharding is only supported for sharded tensors.
+    if t["layout"] != "sharded":
+        raise ValueError("Only sharded tensors can be re-sharded")
+
+    num_devices = len(cluster.devices)
+    name = t["name"]
+    shape = tuple(t["shape"])
+    ndim = len(shape)
+
+    # Normalize both axes so negative axis indices work correctly.
+    old_axis = t["axis"] % ndim
+    new_axis = axis % ndim
+
+    if not 0 <= new_axis < ndim:
+        raise ValueError("Axis out of range")
+
+    # Calculate the target shard boundaries if none were supplied.
+    if bounds is None:
+        target_bounds = shard_bounds(shape[new_axis], num_devices)
+    else:
+        target_bounds = [tuple(b) for b in bounds]
+
+    if len(target_bounds) != num_devices:
+        raise ValueError("Bounds must contain one entry per device")
+
+    # Normalize the existing boundaries for comparison.
+    old_bounds = [tuple(b) for b in t["bounds"]]
+
+    # Avoid unnecessary copies and kernel executions when the layout
+    # already matches the requested layout.
+    if old_axis == new_axis and old_bounds == target_bounds:
+        return t
+
+    # Each destination stores the names of the blocks it receives.
+    received_blocks = [[] for _ in range(num_devices)]
+
+    # Process every target device, then every source device, in order.
+    for j in range(num_devices):
+
+        target_start, target_stop = target_bounds[j]
+
+        for i in range(num_devices):
+
+            source_start, source_stop = old_bounds[i]
+
+            # Determine the region to extract from the source shard.
+            if old_axis == new_axis:
+
+                # For the same axis, extract only the overlap between
+                # the source shard and the target shard.
+                overlap_start = max(source_start, target_start)
+                overlap_stop = min(source_stop, target_stop)
+
+                # No overlap means there is nothing to transfer.
+                if overlap_start >= overlap_stop:
+                    continue
+
+                # Convert global indices into source-shard-local indices.
+                local_start = overlap_start - source_start
+                local_stop = overlap_stop - source_start
+
+                region = axis_slice(
+                    ndim,
+                    old_axis,
+                    local_start,
+                    local_stop
+                )
+
+            else:
+
+                # For different axes, restrict the source shard to
+                # the target interval along the new axis.
+                region = axis_slice(
+                    ndim,
+                    new_axis,
+                    target_start,
+                    target_stop
+                )
+
+            # Check whether the selected block contains any elements.
+            source_array = cluster.devices[i].buffers[name]
+            block = source_array[region]
+
+            # Empty blocks are skipped.
+            if block.size == 0:
+                continue
+
+            # Use a temporary name identifying the source device.
+            temp_name = f"{name}@{i}"
+
+            # Copy the block to the target device.
+            # Same-device copies are handled as local copies by Cluster.
+            cluster.copy(
+                i,
+                j,
+                name,
+                dst_name=temp_name,
+                region=region
+            )
+
+            # Record the block name in source-device order.
+            received_blocks[j].append(temp_name)
+
+    # Assemble the new shard on each destination device.
+    for j in range(num_devices):
+
+        device = cluster.devices[j]
+        temp_names = received_blocks[j]
+
+        target_start, target_stop = target_bounds[j]
+
+        if temp_names:
+
+            # Concatenate the received blocks along the ORIGINAL
+            # sharding axis, preserving their source-device order.
+            device.run(
+                name,
+                lambda *arrays: np.concatenate(
+                    arrays,
+                    axis=old_axis
+                ),
+                *temp_names
+            )
+
+            # Release all temporary block buffers after assembly.
+            for temp_name in temp_names:
+                device.free(temp_name)
+
+        else:
+
+            # This device received no blocks.
+            # Create an empty buffer with the correct new shard shape.
+            empty_shape = list(shape)
+            empty_shape[new_axis] = target_stop - target_start
+
+            device.alloc(
+                name,
+                np.empty(tuple(empty_shape), dtype=np.float64)
+            )
+
+    # Update the existing handle in place.
+    t["axis"] = axis
+    t["bounds"] = target_bounds
+
+    return t
 
 # Step 7 - map_shards (not yet solved)
 # TODO: implement
