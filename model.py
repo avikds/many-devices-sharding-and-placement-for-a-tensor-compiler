@@ -1122,9 +1122,291 @@ def place_graph(kernels, inputs, n_devices, mem_limit):
 
     return best_result
 
-# Step 11 - allreduce_sum (not yet solved)
-# TODO: implement
+# Step 11 - allreduce_sum
+def allreduce_sum(cluster, name, out=None):
+    """Leave the sum of every device's buffer on every device; return the bytes moved."""
 
-# Step 12 - train_step (not yet solved)
-# TODO: implement
+    # Use the original buffer name when no output name is specified.
+    if out is None:
+        out = name
+
+    num_devices = len(cluster.devices)
+
+    if num_devices == 0:
+        raise ValueError("All-reduce requires at least one device")
+
+    # Record the communication counter before starting.
+    moved_before = cluster.bytes_moved
+
+    # ---------------------------------------------------------
+    # Step 1: Copy gradients from all devices to device 0.
+    # ---------------------------------------------------------
+
+    # Preserve the source gradient on each device.
+    # Store remote gradients on device 0 under temporary names.
+    temp_names = []
+
+    # All buffers must have identical shapes.
+    reference_shape = cluster.devices[0].buffers[name].shape
+
+    for i in range(1, num_devices):
+
+        source = cluster.devices[i].buffers[name]
+
+        if source.shape != reference_shape:
+            raise ValueError("All gradient buffers must have the same shape")
+
+    # Copy remote gradients to device 0 in device order.
+    for i in range(1, num_devices):
+
+        temp_name = f"{name}@{i}"
+
+        cluster.copy(
+            i,
+            0,
+            name,
+            dst_name=temp_name
+        )
+
+        temp_names.append(temp_name)
+
+    # ---------------------------------------------------------
+    # Step 2: Sum all gradients on device 0.
+    # ---------------------------------------------------------
+
+    def combine_gradients(*gradients):
+        """Add gradient arrays using a left-to-right accumulation."""
+
+        result = gradients[0]
+
+        for gradient in gradients[1:]:
+            result = result + gradient
+
+        return result
+
+    # The original gradient on device 0 comes first,
+    # followed by the temporary buffers in device order.
+    input_names = [name] + temp_names
+
+    # Execute exactly one combine kernel, even for one device.
+    cluster.devices[0].run(
+        out,
+        combine_gradients,
+        *input_names
+    )
+
+    # ---------------------------------------------------------
+    # Step 3: Free the temporary gradient buffers.
+    # ---------------------------------------------------------
+
+    # Preserve the output if its name happens to coincide
+    # with one of the temporary buffer names.
+    for temp_name in temp_names:
+
+        if temp_name != out:
+            cluster.devices[0].free(temp_name)
+
+    # ---------------------------------------------------------
+    # Step 4: Broadcast the summed gradient to every device.
+    # ---------------------------------------------------------
+
+    for i in range(1, num_devices):
+
+        cluster.copy(
+            0,
+            i,
+            out
+        )
+
+    # Return the total communication cost of this operation.
+    return cluster.bytes_moved - moved_before
+
+# Step 12 - train_step
+def train_step(cluster, x, y, w, lr):
+    """One data-parallel gradient step for the linear model; returns the loss before the update."""
+
+    # Extract the matrix dimensions.
+    n, d = tuple(x["shape"])
+    y_n, m = tuple(y["shape"])
+    w_d, w_m = tuple(w["shape"])
+
+    # ---------------------------------------------------------
+    # Step 1: Validate the input tensors.
+    # ---------------------------------------------------------
+
+    if x["layout"] != "sharded" or y["layout"] != "sharded":
+        raise ValueError("X and Y must have sharded layout")
+
+    if w["layout"] != "replicated":
+        raise ValueError("W must have replicated layout")
+
+    if len(x["shape"]) != 2 or len(y["shape"]) != 2 or len(w["shape"]) != 2:
+        raise ValueError("X, Y, and W must be two-dimensional tensors")
+
+    if x["axis"] not in (0, -2) or y["axis"] not in (0, -2):
+        raise ValueError("X and Y must be sharded along axis 0")
+
+    if y_n != n or w_d != d or w_m != m:
+        raise ValueError("Incompatible shapes for X, Y, and W")
+
+    # Check that X and Y use identical shard boundaries.
+    x_bounds = [tuple(b) for b in x["bounds"]]
+    y_bounds = [tuple(b) for b in y["bounds"]]
+
+    if x_bounds != y_bounds:
+        raise ValueError("X and Y must have the same shard boundaries")
+
+    if len(x_bounds) != len(cluster.devices):
+        raise ValueError("Shard count must match the number of devices")
+
+    if n <= 0:
+        raise ValueError("Training requires a non-empty batch")
+
+    # Names of the six temporary buffers used during training.
+    temporary_names = (
+        "_pred",
+        "_res",
+        "_grad",
+        "_sq",
+        "_rowsq",
+        "_loss"
+    )
+
+    try:
+
+        # -----------------------------------------------------
+        # Step 2: Calculate predictions: _pred = X @ W
+        # -----------------------------------------------------
+
+        # Multiply each device's local rows of X by its replica of W.
+        pred = matmul_shards(
+            cluster,
+            "_pred",
+            x,
+            w
+        )
+
+        # -----------------------------------------------------
+        # Step 3: Calculate residuals: _res = _pred - Y
+        # -----------------------------------------------------
+
+        residual = map_shards(
+            cluster,
+            "_res",
+            lambda prediction, target: prediction - target,
+            pred,
+            y
+        )
+
+        # -----------------------------------------------------
+        # Step 4: Calculate local gradients: _grad = X.T @ R
+        # -----------------------------------------------------
+
+        # Every device calculates a partial gradient using its
+        # own X shard and corresponding residual shard.
+        for device in cluster.devices:
+
+            device.run(
+                "_grad",
+                lambda x_shard, residual_shard: (
+                    x_shard.T @ residual_shard
+                ),
+                x["name"],
+                residual["name"]
+            )
+
+        # -----------------------------------------------------
+        # Step 5: Aggregate gradients using All-Reduce.
+        # -----------------------------------------------------
+
+        # Sum all local gradients and distribute the result
+        # back to every device.
+        allreduce_sum(
+            cluster,
+            "_grad"
+        )
+
+        # -----------------------------------------------------
+        # Step 6: Update weights on every device.
+        # -----------------------------------------------------
+
+        # Apply the same gradient update to every replica of W.
+        # The division by n converts the summed gradient into
+        # the average gradient over the training batch.
+        for device in cluster.devices:
+
+            device.run(
+                w["name"],
+                lambda weights, gradient: (
+                    weights - (lr / n) * gradient
+                ),
+                w["name"],
+                "_grad"
+            )
+
+        # -----------------------------------------------------
+        # Step 7: Calculate squared residuals: _sq = R * R
+        # -----------------------------------------------------
+
+        squared = map_shards(
+            cluster,
+            "_sq",
+            lambda r: r * r,
+            residual
+        )
+
+        # -----------------------------------------------------
+        # Step 8: Sum squared residuals along axis 1.
+        # _rowsq = sum(_sq, axis=1)
+        # -----------------------------------------------------
+
+        row_sums = reduce_shards(
+            cluster,
+            "_rowsq",
+            squared,
+            axis=1,
+            op="sum"
+        )
+
+        # -----------------------------------------------------
+        # Step 9: Sum row-wise results along axis 0.
+        # _loss = sum(_rowsq, axis=0)
+        # -----------------------------------------------------
+
+        total_loss = reduce_shards(
+            cluster,
+            "_loss",
+            row_sums,
+            axis=0,
+            op="sum"
+        )
+
+        # Read the complete loss from device 0.
+        # Divide by 2n to obtain the specified mean squared
+        # error objective with the factor of one-half.
+        loss = (
+            float(cluster.devices[0].buffers["_loss"].item())
+            / (2 * n)
+        )
+
+        # -----------------------------------------------------
+        # Step 10: Return the loss before the weight update.
+        # -----------------------------------------------------
+
+        return float(loss)
+
+    finally:
+
+        # -----------------------------------------------------
+        # Step 11: Free all six temporary buffers.
+        # -----------------------------------------------------
+
+        # Remove temporary buffers from every device that holds them.
+        # Preserve the original inputs and updated weight replicas.
+        for device in cluster.devices:
+
+            for name in temporary_names:
+
+                if name in device.buffers:
+                    device.free(name)
 
